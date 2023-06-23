@@ -5,6 +5,7 @@ use escapepod::Args;
 use nix::unistd::{execvp, fork, ForkResult};
 
 fn main() {
+    escapepod_common::tracing::init();
     let args = Args::parse();
 
     assert!(args.exec.len() > 0);
