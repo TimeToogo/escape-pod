@@ -21,6 +21,12 @@ pub struct Buffer {
     pub buf: Vec<u8>,
 }
 
+impl Buffer {
+    pub fn new(buffer: BufferId, buf: Vec<u8>) -> Self {
+        Self { buffer, buf }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct File {
     pub id: FileId,
@@ -43,6 +49,19 @@ pub struct Process {
     pub fd_table: Vec<Fd>,
     pub threads: Vec<Thread>,
 }
+impl Process {
+    pub fn self_and_descendents(&self) -> Vec<&Process> {
+        let mut procs = vec![self];
+
+        for t in &self.threads {
+            for p in t.children.iter() {
+                procs.extend_from_slice(p.self_and_descendents().as_slice());
+            }
+        }
+
+        return procs;
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct Thread {
@@ -55,11 +74,11 @@ pub struct Thread {
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct MemoryMapping {
-    pub tid: pid_t,
     pub address: u64,
     pub len: u64,
     pub perm: c_int,
-    pub flags: c_int,
+    #[bincode(with_serde)]
+    pub r#type: procfs::process::MMapPath,
     pub data: MemoryMappingData,
 }
 
@@ -77,8 +96,8 @@ pub struct MappedFile {
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct Fd {
-    pub pid: pid_t,
-    pub fd: u32,
+    pub fd: i32,
+    pub mode: u16,
     pub r#type: FdType,
 }
 
@@ -93,7 +112,6 @@ pub enum FdType {
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct FdFile {
     pub file: PathBuf,
-    pub mode: mode_t,
     pub position: u64,
 }
 
@@ -111,12 +129,5 @@ pub enum FdSocketIp {
 
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]
 pub struct FdPipe {
-    pub pipe_id: u32,
-    pub half: FdPipeHalf,
-}
-
-#[derive(Debug, Clone, PartialEq, Encode, Decode)]
-pub enum FdPipeHalf {
-    Read,
-    Write,
+    pub pipe_id: u64,
 }

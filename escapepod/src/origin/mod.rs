@@ -8,13 +8,13 @@ use std::{
 use escapepod_common::{
     nix::{
         sys::{
-            signal::{self, SigAction, Signal},
+            signal::{self, Signal},
             signalfd::SigSet,
-            wait::{wait, waitpid, WaitPidFlag, WaitStatus},
+            wait::{waitpid, WaitStatus},
         },
         unistd::{execvp, fork, ForkResult, Pid},
     },
-    proto::EscapeeMessage,
+    proto::{Buffer, EscapeeMessage, MemoryMappingData},
     tracing::{debug, error, info},
     transport::Server,
 };
@@ -49,12 +49,17 @@ fn origin_server(args: Args, mut server: Server, child: Pid) -> i32 {
 
     let (tx, rx) = mpsc::channel();
 
+    // ignore all signals by default with the exception of SIGCHILD
+    // as POSIX mandates that this will chage waitpid's semantics in a way we do not want.
     unsafe {
         debug!("ignoring signals");
         for signal in SigSet::all().iter().filter(|i| *i != Signal::SIGCHLD) {
             let _ = signal::signal(signal, signal::SigHandler::SigIgn);
         }
     }
+
+    // we have ensure that only our dedicated waiter thread receives the signal
+    SigSet::all().thread_block().unwrap();
 
     thread::spawn({
         let tx = tx.clone();
@@ -73,9 +78,6 @@ fn origin_server(args: Args, mut server: Server, child: Pid) -> i32 {
         }
     });
 
-    // we have ensure that only our dedicated waiter thread receives the signal
-    SigSet::all().thread_block().unwrap();
-
     thread::spawn({
         let tx = tx.clone();
         move || {
@@ -85,6 +87,7 @@ fn origin_server(args: Args, mut server: Server, child: Pid) -> i32 {
             let status = match status {
                 WaitStatus::Exited(_, status) => status,
                 WaitStatus::Signaled(_, signal, _) => 128 + (signal as i32),
+                WaitStatus::Stopped(_, _) => return,
                 _ => panic!("unexpected: {status:?}"),
             };
             let _ = tx.send(Event::ChildExited(status));
@@ -122,18 +125,36 @@ fn origin_server(args: Args, mut server: Server, child: Pid) -> i32 {
     let mut con = server.accept().unwrap();
     info!("received connection from {}", con.peer_addr());
 
-    // let procs = proc::freeze(&args, &mut con).expect("failed to freeze processes");
-    // con.send(EscapeeMessage::ProcessTrees(procs));
-    // info!("froze child processes");
+    let procs = proc::freeze(&args, child).expect("failed to freeze processes");
+    con.send(EscapeeMessage::ProcessTrees(procs.clone()))
+        .unwrap();
+    info!("froze child processes");
 
-    // let procs = proc::freeze(&args, &mut con).expect("failed to freeze processes");
-    // con.send(EscapeeMessage::ProcessTrees(procs));
-    // info!("froze child processes");
+    for proc in procs.iter().flat_map(|i| i.self_and_descendents()) {
+        for mmap in &proc.mmaps {
+            if let MemoryMappingData::Buffer(id) = &mmap.data {
+                let data = proc::read_mmap(proc, mmap).expect("failed to read proc mmap");
+                con.send(EscapeeMessage::Buffer(Buffer::new(*id, data)))
+                    .unwrap();
+            }
+        }
+    }
+    info!("sent process memory");
+
+    // todo: files
+
+    for proc in procs.iter().flat_map(|i| i.self_and_descendents()) {
+        let _ = proc::kill(proc);
+    }
+
+    con.send(EscapeeMessage::Done).unwrap();
+    drop(con);
 
     0
 }
 
 unsafe fn origin_entrypoint_exec(args: Args) {
+    // todo: new pgrp here?
     // only safe to exec here
     let exec = args
         .exec

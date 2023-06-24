@@ -9,7 +9,7 @@ fn escape_hello_world_binary() {
         process::Command::new(escapepod_bin())
             .args(&["--signal", "SIGUSR1"])
             .args(&["--launch-pod-command"])
-            .arg(format!("ESCAPEE_ADDR=localhost:$ESCAPEE_PORT {} --launch-pod-command test --port 0 -- test", escapepod_bin()))
+            .arg(format!("ESCAPEE_ADDR=localhost:$ESCAPEE_PORT {} --launch-pod-command test --port 0 -- test &", escapepod_bin()))
             .args(&["--port", "0"])
             .args(&["--", "sleep", "infinity"]),
     );

@@ -7,9 +7,10 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.71"
-bincode = "2.0.0-rc.3"
+bincode = { version = "2.0.0-rc.3", features = ["serde"] }
 libc = "0.2.146"
 nix = "0.26.2"
+procfs = { version = "0.15.1", features = ["serde", "serde1"] }
 serde = "1.0.164"
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
