@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.71"
+bincode = "2.0.0-rc.3"
 libc = "0.2.146"
 nix = "0.26.2"
 serde = "1.0.164"
