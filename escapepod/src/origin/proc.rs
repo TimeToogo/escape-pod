@@ -1,5 +1,6 @@
 use std::{
     ffi::c_void,
+    io::IoSliceMut,
     mem::{size_of, MaybeUninit},
     slice,
     sync::atomic::{AtomicU32, Ordering},
@@ -12,6 +13,7 @@ use escapepod_common::{
         sys::{
             ptrace,
             signal::{self, Signal},
+            uio::{process_vm_readv, RemoteIoVec},
         },
         unistd::Pid,
     },
@@ -29,7 +31,7 @@ use crate::args::Args;
 
 static BUFFER_ID: AtomicU32 = AtomicU32::new(0);
 
-pub(crate) fn freeze(args: &Args, child: Pid) -> Result<Vec<Process>> {
+pub(crate) fn freeze(_args: &Args, child: Pid) -> Result<Vec<Process>> {
     let mut procs = vec![];
     freeze_proc_recursive(child, &mut procs)?;
 
@@ -55,48 +57,48 @@ fn freeze_proc_recursive(pid: Pid, procs: &mut Vec<procfs::process::Process>) ->
 fn parse_proc_recursive(pid: Pid) -> Result<Process> {
     let proc = procfs::process::Process::new(pid.as_raw())?;
 
-    let proc = Process {
-        pid: proc.pid(),
-        mmaps: proc
-            .maps()?
-            .into_iter()
-            .map(|m| MemoryMapping {
-                address: m.address.0,
-                len: m.address.1 - m.address.0,
-                perm: m.perms.bits() as _,
-                r#type: m.pathname.clone(),
-                data: match m.pathname {
-                    MMapPath::Path(path) => MemoryMappingData::File(MappedFile {
-                        path,
-                        offset: m.offset,
+    let fd_table = proc
+        .fd()?
+        .into_iter()
+        .map(|f| {
+            f.map(|f| Fd {
+                fd: f.fd,
+                mode: f.mode as _,
+                r#type: match f.target {
+                    FDTarget::Path(f) => FdType::File(FdFile {
+                        file: f,
+                        position: 0, // todo
                     }),
-                    _ => MemoryMappingData::Buffer(BUFFER_ID.fetch_add(1, Ordering::Relaxed)),
+                    FDTarget::Socket(_) => todo!(),
+                    FDTarget::Net(_) => todo!(),
+                    FDTarget::Pipe(id) => FdType::Pipe(FdPipe { pipe_id: id }),
+                    FDTarget::AnonInode(_) => todo!(),
+                    FDTarget::MemFD(_) => todo!(),
+                    FDTarget::Other(_, _) => todo!(),
                 },
             })
-            .collect(),
-        fd_table: proc
-            .fd()?
-            .into_iter()
-            .map(|f| {
-                f.map(|f| Fd {
-                    fd: f.fd,
-                    mode: f.mode,
-                    r#type: match f.target {
-                        FDTarget::Path(f) => FdType::File(FdFile {
-                            file: f,
-                            position: 0, // todo
-                        }),
-                        FDTarget::Socket(_) => todo!(),
-                        FDTarget::Net(_) => todo!(),
-                        FDTarget::Pipe(id) => FdType::Pipe(FdPipe { pipe_id: id }),
-                        FDTarget::AnonInode(_) => todo!(),
-                        FDTarget::MemFD(_) => todo!(),
-                        FDTarget::Other(_, _) => todo!(),
-                    },
-                })
-                .context("fd")
-            })
-            .collect::<Result<Vec<_>>>()?,
+            .context("fd")
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mmaps = proc
+        .maps()?
+        .into_iter()
+        .map(|m| MemoryMapping {
+            address: m.address.0,
+            len: m.address.1 - m.address.0,
+            perm: m.perms.bits() as _,
+            data: match m.pathname {
+                MMapPath::Vvar => MemoryMappingData::KernelVvar,
+                _ => MemoryMappingData::Buffer(BUFFER_ID.fetch_add(1, Ordering::Relaxed)),
+            },
+        })
+        .collect();
+
+    let proc = Process {
+        pid: proc.pid(),
+        mmaps,
+        fd_table,
         threads: proc
             .tasks()?
             .into_iter()
@@ -148,11 +150,26 @@ fn get_thread_regset(t: &procfs::process::Task) -> Result<Vec<u8>> {
         reg
     };
 
+    ptrace::detach(pid, None)?;
+
     Ok(reg)
 }
 
 pub(crate) fn read_mmap(proc: &Process, mmap: &MemoryMapping) -> Result<Vec<u8>> {
-    todo!()
+    let mut buf = vec![0u8; mmap.len as _];
+    let mut remote_iov = vec![RemoteIoVec {
+        base: mmap.address as _,
+        len: mmap.len as _,
+    }];
+
+    // since we only have one iovec element this cannot result in a partial read
+    process_vm_readv(
+        Pid::from_raw(proc.pid),
+        &mut [IoSliceMut::new(buf.as_mut_slice())],
+        remote_iov.as_mut_slice(),
+    )?;
+
+    Ok(buf)
 }
 
 pub(crate) fn kill(proc: &Process) -> Result<()> {

@@ -2,6 +2,7 @@
 
 members = [
     "escapepod",
+    "escapepod-restore",
     "escapepod-preload",
     "escapepod-common",
     "escapepod-tests",
