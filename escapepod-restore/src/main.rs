@@ -1,32 +1,39 @@
-use std::{env, mem::size_of, ptr};
+use std::{
+    arch::asm,
+    env,
+    mem::{self, size_of},
+    ptr,
+};
 
 use escapepod_common::{
-    libc::{memcpy, _SC_PAGESIZE, _SC_PAGE_SIZE},
+    libc::memcpy,
     nix::{
         self,
         fcntl::OFlag,
         sys::{
             mman::{mmap, MapFlags, ProtFlags},
+            signal::Signal,
             stat::Mode,
         },
-        unistd::{close, getpid, sysconf, SysconfVar},
+        unistd::{getpid, sysconf, SysconfVar},
     },
-    procfs::{self, process::MMapPath},
-    proto::{FdType, MemoryMapping, MemoryMappingData, Process},
+    procfs::{self},
+    proto::{FdType, MemoryMappingData, Process},
     serde_json,
     tracing::trace,
 };
+use syscalls::Sysno;
 
 const RESTORE_SPACE: usize = 100 * 1024;
 
 #[derive(Debug)]
-struct CurrentMmap {
+pub struct CurrentMmap {
     addr: usize,
     len: usize,
 }
 
 #[derive(Debug)]
-struct NewMmap {
+pub struct NewMmap {
     addr: usize,
     len: usize,
     prot: i32,
@@ -35,12 +42,14 @@ struct NewMmap {
     offset: usize,
 }
 
-struct RestoreState {
+pub struct RestoreState {
     current_mmaps: (usize, *const CurrentMmap),
     // mmaps to create
     new_mmaps: (usize, *const NewMmap),
     // restore complete signal fd
     fd: i32,
+    // current pid
+    pid: i32,
 }
 
 fn main() {
@@ -144,6 +153,7 @@ fn main() {
     // first copy the required state to the new mmapped region
     unsafe {
         let state = RestoreState {
+            pid: proc.pid,
             fd: ready_fd,
             current_mmaps: (
                 current_mmaps.len(),
@@ -171,13 +181,28 @@ fn main() {
             &new_mmaps as *const _ as _,
             size_of::<NewMmap>() * state.new_mmaps.0,
         );
+
+        trace!("copied restore state");
+
+        // copy restore code
+        let (start, end) = restore_fn_code();
+        trace!(
+            "restore fn addr {start:?}-{end:?} ({})",
+            end.offset_from(start)
+        );
+        memcpy(
+            (state.new_mmaps.1 as usize + size_of::<NewMmap>() * state.new_mmaps.0) as _,
+            start as _,
+            end.offset_from(start) as _,
+        );
+        trace!("restore fn copied");
     }
-
-    trace!("copied restore state");
-
-    // copy restore code
-    unsafe { todo!() }
     // copy restore routine to mmap, jump there, fix stack?, unmap all, remap new, signal done
+
+    // trick compiler into not eliding the restore fn
+    unsafe {
+        restore(0 as _);
+    }
 }
 
 fn find_safe_address_space(proc: &mut Process) -> (usize, usize) {
@@ -197,4 +222,82 @@ fn find_safe_address_space(proc: &mut Process) -> (usize, usize) {
     }
 
     panic!("could not find suitable address space")
+}
+
+// this is our restore function
+// its goals is to restore the memory mappings to the state before the process froze
+#[no_mangle]
+#[inline(never)]
+pub unsafe extern "C" fn restore(state: *const RestoreState) {
+    let state = mem::transmute::<_, &'static RestoreState>(state);
+
+    // stage 1: unmap existing memory mappings (except the restore state and code)
+    let (len, mmaps) = state.current_mmaps;
+    for i in 0..len {
+        let mmap = mmaps.add(i).read_unaligned();
+
+        let res = syscalls::raw::syscall2(Sysno::munmap, mmap.addr, mmap.len);
+        // assert!(res == 0);
+    }
+
+    // stage 2: recreate process maps
+    let (len, mmaps) = state.new_mmaps;
+    for i in 0..len {
+        let mmap = mmaps.add(i).read_unaligned();
+
+        let res = syscalls::raw::syscall6(
+            Sysno::mmap,
+            mmap.addr,
+            mmap.len,
+            mmap.prot as _,
+            mmap.flags as _,
+            mmap.fd as _,
+            mmap.offset,
+        );
+        // assert!(res == 0);
+    }
+
+    // stage 3: signal main process that the mmaps have been restored
+    let res = syscalls::raw::syscall3(Sysno::write, state.fd as _, &state as *const _ as usize, 1);
+    // assert!(res == 1);
+
+    // stage 4: stop the current process
+    syscalls::raw::syscall2(Sysno::kill, state.pid as _, Signal::SIGSTOP as _);
+
+    // end function marker
+    asm!("ret", "ret", "ret", "ret", "ret", "ret", "ret", "ret", "ret", "ret")
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn restore_fn_code() -> (*const u8, *const u8) {
+    // todo: i'm sorry
+    // let addr = &restore as *const u8;
+    #[allow(overflowing_literals)]
+    let ret = 0xC0035FD6;
+
+    let start = &restore as *const _ as *const u8;
+    let mut addr = start as *const i32;
+    let mut rets = 0;
+    let mut last = 0;
+    let mut i = 0;
+    let end = loop {
+        trace!("{:#02x}", *addr);
+        if *addr == last {
+            rets += 1;
+        } else {
+            rets = 0;
+            last = *addr;
+        }
+
+        if rets == 5 || i == 540 / 4 {
+            trace!("last: {}", last);
+            break addr.sub(rets) as *const _;
+        }
+
+
+        addr = addr.add(1);
+        i += 1;
+    };
+
+    (start, end)
 }
