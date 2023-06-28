@@ -22,35 +22,12 @@ use escapepod_common::{
     serde_json,
     tracing::trace,
 };
+use escapepod_restore::{restore, CurrentMmap, NewMmap, RestoreState};
 use syscalls::Sysno;
 
 const RESTORE_SPACE: usize = 100 * 1024;
 
-#[derive(Debug)]
-pub struct CurrentMmap {
-    addr: usize,
-    len: usize,
-}
-
-#[derive(Debug)]
-pub struct NewMmap {
-    addr: usize,
-    len: usize,
-    prot: i32,
-    flags: i32,
-    fd: i32,
-    offset: usize,
-}
-
-pub struct RestoreState {
-    current_mmaps: (usize, *const CurrentMmap),
-    // mmaps to create
-    new_mmaps: (usize, *const NewMmap),
-    // restore complete signal fd
-    fd: i32,
-    // current pid
-    pid: i32,
-}
+// const RESTORE_FN_CODE: &[u8] = include_bytes!("../target/realease/escapepod-restore-inner.s");
 
 fn main() {
     escapepod_common::tracing::init();
@@ -152,20 +129,23 @@ fn main() {
 
     // first copy the required state to the new mmapped region
     unsafe {
+        let ptr = restore_addr;
+        let current_mmaps_addr = restore_addr.add(size_of::<RestoreState>());
+        let new_mmaps_addr = current_mmaps_addr.add(size_of::<CurrentMmap>() * current_mmaps.len());
+        let restore_fn_addr = new_mmaps_addr.add(size_of::<NewMmap>() * new_mmaps.len());
+        let restore_fn_addr = restore_fn_addr.add(restore_fn_addr.align_offset(8));
+        let stack_pointer_addr = restore_fn_addr.add(size_of::<NewMmap>() * new_mmaps.len());
+        let stack_pointer_addr = stack_pointer_addr.add(stack_pointer_addr.align_offset(8));
+
         let state = RestoreState {
             pid: proc.pid,
             fd: ready_fd,
-            current_mmaps: (
-                current_mmaps.len(),
-                restore_addr.add(size_of::<RestoreState>()) as _,
-            ),
-            new_mmaps: (
-                new_mmaps.len(),
-                restore_addr
-                    .add(size_of::<RestoreState>())
-                    .add(size_of::<CurrentMmap>() * current_mmaps.len()) as _,
-            ),
+            current_mmaps: (current_mmaps.len(), current_mmaps_addr as _),
+            new_mmaps: (new_mmaps.len(), new_mmaps_addr as _),
+            restore_fn: restore_fn_addr,
+            stack_pointer: stack_pointer_addr,
         };
+
         memcpy(
             restore_addr,
             &state as *const _ as _,
@@ -182,26 +162,38 @@ fn main() {
             size_of::<NewMmap>() * state.new_mmaps.0,
         );
 
-        trace!("copied restore state");
-
-        // copy restore code
         let (start, end) = restore_fn_code();
         trace!(
             "restore fn addr {start:?}-{end:?} ({})",
             end.offset_from(start)
         );
         memcpy(
-            (state.new_mmaps.1 as usize + size_of::<NewMmap>() * state.new_mmaps.0) as _,
+            state.restore_fn as _,
             start as _,
             end.offset_from(start) as _,
         );
         trace!("restore fn copied");
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            // set the stack pointer to the new address and call the restore function
+            unsafe {
+                asm!(
+                    "mov x0, {r}",
+                    "msr el_sp0, {s}",
+                    "br {f}",
+                    r = in(reg) restore_addr,
+                    s = in(reg) state.stack_pointer,
+                    f = in(reg) state.restore_fn
+                );
+            }
+        }
     }
+
     // copy restore routine to mmap, jump there, fix stack?, unmap all, remap new, signal done
 
-    // trick compiler into not eliding the restore fn
     unsafe {
-        restore(0 as _);
+        restore::restore(ptr::null());
     }
 }
 
@@ -224,80 +216,7 @@ fn find_safe_address_space(proc: &mut Process) -> (usize, usize) {
     panic!("could not find suitable address space")
 }
 
-// this is our restore function
-// its goals is to restore the memory mappings to the state before the process froze
-#[no_mangle]
-#[inline(never)]
-pub unsafe extern "C" fn restore(state: *const RestoreState) {
-    let state = mem::transmute::<_, &'static RestoreState>(state);
-
-    // stage 1: unmap existing memory mappings (except the restore state and code)
-    let (len, mmaps) = state.current_mmaps;
-    for i in 0..len {
-        let mmap = mmaps.add(i).read_unaligned();
-
-        let res = syscalls::raw::syscall2(Sysno::munmap, mmap.addr, mmap.len);
-        // assert!(res == 0);
-    }
-
-    // stage 2: recreate process maps
-    let (len, mmaps) = state.new_mmaps;
-    for i in 0..len {
-        let mmap = mmaps.add(i).read_unaligned();
-
-        let res = syscalls::raw::syscall6(
-            Sysno::mmap,
-            mmap.addr,
-            mmap.len,
-            mmap.prot as _,
-            mmap.flags as _,
-            mmap.fd as _,
-            mmap.offset,
-        );
-        // assert!(res == 0);
-    }
-
-    // stage 3: signal main process that the mmaps have been restored
-    let res = syscalls::raw::syscall3(Sysno::write, state.fd as _, &state as *const _ as usize, 1);
-    // assert!(res == 1);
-
-    // stage 4: stop the current process
-    syscalls::raw::syscall2(Sysno::kill, state.pid as _, Signal::SIGSTOP as _);
-
-    // end function marker
-    asm!("ret", "ret", "ret", "ret", "ret", "ret", "ret", "ret", "ret", "ret")
-}
-
 #[cfg(target_arch = "aarch64")]
 unsafe fn restore_fn_code() -> (*const u8, *const u8) {
-    // todo: i'm sorry
-    // let addr = &restore as *const u8;
-    #[allow(overflowing_literals)]
-    let ret = 0xC0035FD6;
-
-    let start = &restore as *const _ as *const u8;
-    let mut addr = start as *const i32;
-    let mut rets = 0;
-    let mut last = 0;
-    let mut i = 0;
-    let end = loop {
-        trace!("{:#02x}", *addr);
-        if *addr == last {
-            rets += 1;
-        } else {
-            rets = 0;
-            last = *addr;
-        }
-
-        if rets == 5 || i == 540 / 4 {
-            trace!("last: {}", last);
-            break addr.sub(rets) as *const _;
-        }
-
-
-        addr = addr.add(1);
-        i += 1;
-    };
-
-    (start, end)
+    todo!()
 }
